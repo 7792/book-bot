@@ -64,8 +64,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user is None or update.effective_message is None:
         return
 
-    user = update.effective_user---===-------==
-    try:
+    user = update.effective_user
+    try:  
         subscribed = await check_membership(context, user.id)
     except Exception as exc:
         ogger.exception("Could not verify channel membership for user %s: %s", user.id, exc)
