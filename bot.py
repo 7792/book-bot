@@ -68,7 +68,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:  
         subscribed = await check_membership(context, user.id)
     except Exception as exc:
-        ogger.exception("Could not verify channel membership for user %s: %s", user.id, exc)
+        logger.exception("Could not verify channel membership for user %s: %s", user.id, exc)
         await update.effective_message.reply_text(
             "Не вдалося перевірити підписку. Спробуйте ще раз трохи пізніше."
         )
@@ -123,7 +123,7 @@ async def winners(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 unsubscribed_ids.append(user_id)
         except Exception:
             verification_errors += 1
-            logger.exception("Could not re-check channel membership for user %s", user_id)
+            llogger.exception("Could not re-check channel membership for user %s", user_id)
 
     for user_id in unsubscribed_ids:
         participants.pop(user_id, None)
