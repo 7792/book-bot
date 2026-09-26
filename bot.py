@@ -64,11 +64,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user is None or update.effective_message is None:
         return
 
-    user = update.effective_user
+    user = update.effective_user---===-------==
     try:
         subscribed = await check_membership(context, user.id)
-    except Exception:
-        logger.exception("Could not verify channel membership for user %s", user.id)
+    except Exception as exc:
+        ogger.exception("Could not verify channel membership for user %s: %s", user.id, exc)
         await update.effective_message.reply_text(
             "Не вдалося перевірити підписку. Спробуйте ще раз трохи пізніше."
         )
