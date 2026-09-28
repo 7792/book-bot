@@ -1,10 +1,12 @@
+import asyncio
+import hashlib
 import logging
 import os
 import random
 import threading
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import psycopg
 from psycopg.rows import dict_row
 from telegram import Update
@@ -23,14 +25,51 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip()
 ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+WEBHOOK_BASE_URL = os.environ.get(
+    "WEBHOOK_BASE_URL",
+    os.environ.get("RENDER_EXTERNAL_URL", ""),
+).strip().rstrip("/")
 
 health_app = Flask(__name__)
+telegram_application = None
+telegram_loop = None
+telegram_ready = threading.Event()
+telegram_startup_error = None
 
 
 @health_app.get("/")
 @health_app.get("/health")
 def health():
     return jsonify(status="ok", service="Книжковий Джин"), 200
+
+
+def webhook_path() -> str:
+    secret = hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()[:32]
+    return f"/telegram/{secret}"
+
+
+@health_app.post("/telegram/<secret>")
+def telegram_webhook(secret):
+    expected = webhook_path().rsplit("/", 1)[-1]
+    if secret != expected:
+        return jsonify(status="not found"), 404
+
+    if not telegram_ready.is_set():
+        return jsonify(status="starting"), 503
+
+    update = Update.de_json(request.get_json(force=True), telegram_application.bot)
+    future = asyncio.run_coroutine_threadsafe(
+        telegram_application.process_update(update),
+        telegram_loop,
+    )
+
+    try:
+        future.result(timeout=25)
+    except Exception:
+        logger.exception("Could not process Telegram webhook update")
+        return jsonify(status="error"), 500
+
+    return jsonify(status="ok"), 200
 
 
 def get_connection():
@@ -398,13 +437,29 @@ async def participants_count(
     )
 
 
-def run_health_server() -> None:
-    port = int(os.environ.get("PORT", "10000"))
-    health_app.run(
-        host="0.0.0.0",
-        port=port,
-        use_reloader=False,
-    )
+def run_telegram_application() -> None:
+    global telegram_loop, telegram_startup_error
+
+    telegram_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(telegram_loop)
+
+    async def start_application():
+        await telegram_application.initialize()
+        await telegram_application.start()
+        await telegram_application.bot.set_webhook(
+            url=f"{WEBHOOK_BASE_URL}{webhook_path()}",
+            allowed_updates=Update.ALL_TYPES,
+        )
+
+    try:
+        telegram_loop.run_until_complete(start_application())
+        telegram_ready.set()
+        logger.info("Telegram webhook is ready")
+        telegram_loop.run_forever()
+    except Exception as exc:
+        telegram_startup_error = exc
+        telegram_ready.set()
+        logger.exception("Telegram application could not start")
 
 
 def load_admin_id() -> int:
@@ -424,6 +479,7 @@ def validate_configuration() -> None:
             ("CHANNEL_USERNAME", CHANNEL_USERNAME),
             ("ADMIN_ID", ADMIN_ID_RAW),
             ("DATABASE_URL", DATABASE_URL),
+            ("WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL", WEBHOOK_BASE_URL),
         )
         if not value
     ]
@@ -439,18 +495,30 @@ if __name__ == "__main__":
     ADMIN_ID = load_admin_id()
     init_database()
 
-    threading.Thread(
-        target=run_health_server,
-        daemon=True,
-    ).start()
+    telegram_application = Application.builder().token(BOT_TOKEN).build()
 
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("winners", winners))
-    application.add_handler(CommandHandler("new", new_giveaway))
-    application.add_handler(
+    telegram_application.add_handler(CommandHandler("start", start))
+    telegram_application.add_handler(CommandHandler("winners", winners))
+    telegram_application.add_handler(CommandHandler("new", new_giveaway))
+    telegram_application.add_handler(
         CommandHandler("participants", participants_count)
     )
 
-    application.run_polling()
+    threading.Thread(
+        target=run_telegram_application,
+        daemon=True,
+    ).start()
+    telegram_ready.wait(timeout=30)
+
+    if telegram_startup_error is not None:
+        raise RuntimeError("Telegram application failed to start") from telegram_startup_error
+
+    if not telegram_ready.is_set():
+        raise RuntimeError("Telegram application startup timed out")
+
+    port = int(os.environ.get("PORT", "10000"))
+    health_app.run(
+        host="0.0.0.0",
+        port=port,
+        use_reloader=False,
+    )
