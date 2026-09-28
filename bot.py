@@ -1,11 +1,12 @@
 import logging
 import os
 import random
-import sqlite3
 import threading
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify
+import psycopg
+from psycopg.rows import dict_row
 from telegram import Update
 from telegram.constants import ChatMemberStatus
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -16,11 +17,12 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip()
 ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "").strip()
-DB_PATH = os.environ.get("DB_PATH", "/tmp/book_genie.db").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 health_app = Flask(__name__)
 
@@ -32,9 +34,7 @@ def health():
 
 
 def get_connection():
-    connection = sqlite3.connect(DB_PATH, timeout=30)
-    connection.row_factory = sqlite3.Row
-    return connection
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def init_database():
@@ -42,7 +42,7 @@ def init_database():
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS giveaways (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active'
             )
@@ -51,8 +51,8 @@ def init_database():
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS participants (
-                giveaway_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
+                giveaway_id BIGINT NOT NULL REFERENCES giveaways(id),
+                user_id BIGINT NOT NULL,
                 label TEXT NOT NULL,
                 joined_at TEXT NOT NULL,
                 PRIMARY KEY (giveaway_id, user_id)
@@ -62,8 +62,8 @@ def init_database():
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS winners (
-                giveaway_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
+                giveaway_id BIGINT NOT NULL REFERENCES giveaways(id),
+                user_id BIGINT NOT NULL,
                 label TEXT NOT NULL,
                 selected_at TEXT NOT NULL,
                 PRIMARY KEY (giveaway_id, user_id)
@@ -79,7 +79,7 @@ def init_database():
         if active is None:
             connection.execute(
                 "INSERT INTO giveaways (created_at, status) "
-                "VALUES (?, 'active')",
+                "VALUES (%s, 'active')",
                 (datetime.now(timezone.utc).isoformat(),),
             )
 
@@ -167,7 +167,7 @@ async def start(
             """
             SELECT 1
             FROM participants
-            WHERE giveaway_id = ? AND user_id = ?
+            WHERE giveaway_id = %s AND user_id = %s
             """,
             (giveaway_id, user.id),
         ).fetchone()
@@ -182,7 +182,7 @@ async def start(
             """
             INSERT INTO participants
                 (giveaway_id, user_id, label, joined_at)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
             """,
             (
                 giveaway_id,
@@ -234,7 +234,7 @@ async def winners(
             """
             SELECT user_id, label
             FROM participants
-            WHERE giveaway_id = ?
+            WHERE giveaway_id = %s
             """,
             (giveaway_id,),
         ).fetchall()
@@ -282,7 +282,7 @@ async def winners(
 
     with get_connection() as connection:
         connection.execute(
-            "DELETE FROM winners WHERE giveaway_id = ?",
+            "DELETE FROM winners WHERE giveaway_id = %s",
             (giveaway_id,),
         )
 
@@ -291,7 +291,7 @@ async def winners(
                 """
                 INSERT INTO winners
                     (giveaway_id, user_id, label, selected_at)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
                 """,
                 (
                     giveaway_id,
@@ -336,18 +336,30 @@ async def new_giveaway(
         return
 
     with get_connection() as connection:
+        current = connection.execute(
+            "SELECT id FROM giveaways WHERE status = 'active' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        if current is not None:
+            connection.execute(
+                "DELETE FROM participants WHERE giveaway_id = %s",
+                (int(current["id"]),),
+            )
+
         connection.execute(
             "UPDATE giveaways SET status = 'closed' "
             "WHERE status = 'active'"
         )
-        cursor = connection.execute(
+        row = connection.execute(
             """
             INSERT INTO giveaways (created_at, status)
-            VALUES (?, 'active')
+            VALUES (%s, 'active')
+            RETURNING id
             """,
             (datetime.now(timezone.utc).isoformat(),),
-        )
-        new_id = cursor.lastrowid
+        ).fetchone()
+        new_id = int(row["id"])
 
     await update.effective_message.reply_text(
         f"Новий розіграш №{new_id} розпочато 📚✨\n"
@@ -375,7 +387,7 @@ async def participants_count(
             """
             SELECT COUNT(*) AS total
             FROM participants
-            WHERE giveaway_id = ?
+            WHERE giveaway_id = %s
             """,
             (giveaway_id,),
         ).fetchone()
@@ -411,6 +423,7 @@ def validate_configuration() -> None:
             ("BOT_TOKEN", BOT_TOKEN),
             ("CHANNEL_USERNAME", CHANNEL_USERNAME),
             ("ADMIN_ID", ADMIN_ID_RAW),
+            ("DATABASE_URL", DATABASE_URL),
         )
         if not value
     ]
