@@ -157,6 +157,14 @@ def participant_label(user) -> str:
     return f"{name} (ID: {user.id})"
 
 
+def participant_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "учасник"
+    if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        return "учасники"
+    return "учасників"
+
+
 async def check_membership(
     context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> bool:
@@ -431,9 +439,10 @@ async def participants_count(
             (giveaway_id,),
         ).fetchone()
 
+    total = int(row["total"])
     await update.effective_message.reply_text(
         f"У розіграші №{giveaway_id} зареєстровано "
-        f"{int(row['total'])} учасників 📚"
+        f"{total} {participant_word(total)} 📚"
     )
 
 
